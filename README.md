@@ -102,6 +102,7 @@ bhc check --with-otp
 ## Usage
 
 ```bash
+bhc vpn-setup     # one-time UAC approval for the fixed signed client
 bhc vpn-status    # inspect the Windows client, WSL route, and bastion port
 bhc vpn-open      # start the Windows client and wait for the route
 bhc ssh          # default: login05
@@ -112,7 +113,9 @@ bhc check
 bhc check --with-otp
 ```
 
-`vpn-open` launches the installed Windows client from WSL; it does not enter, store, or bypass VPN credentials. Complete authentication in the Windows client window, then use `bhc vpn-status` to verify that `10.100.0.88:22` is reachable. These commands require Windows interop and are not a replacement Linux VPN implementation.
+Run `vpn-setup` once to register `\BJMU HPC\SafeConnect` as an on-demand Windows task. Setup accepts only a validly signed `sslvpn-client.exe` under Windows Program Files, fixes the task action to that path, uses the current interactive user at the highest run level, and does not store a Windows password. Windows requests UAC approval during setup; later `vpn-open` calls use the task without repeating that prompt. Use `bhc vpn-setup-remove` to remove it.
+
+`vpn-open` does not enter, store, or bypass VPN credentials. Complete VPN authentication in the Windows client when necessary, then use `bhc vpn-status` to verify that `10.100.0.88:22` is reachable. Without the task, `vpn-open` falls back to direct Windows elevation. These commands require Windows interop and are not a replacement Linux VPN implementation.
 
 `-N` specifies the numeric suffix of the asset name, not the gateway menu position. Run long workloads through Slurm rather than directly on a login node.
 

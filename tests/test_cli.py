@@ -106,6 +106,12 @@ class ParserTests(unittest.TestCase):
             args = cli.parse_args()
         self.assertEqual(args.wait, 3.5)
 
+    def test_vpn_setup_commands(self) -> None:
+        for command in ("vpn-setup", "vpn-setup-remove"):
+            with self.subTest(command=command), patch.object(sys, "argv", ["bhc", command]):
+                args = cli.parse_args()
+            self.assertEqual(args.mode, command)
+
 
 class VpnTests(unittest.TestCase):
     def config(self) -> cli.Config:
@@ -117,6 +123,7 @@ class VpnTests(unittest.TestCase):
         with (
             patch.object(cli, "is_wsl", return_value=True),
             patch.object(cli, "windows_vpn_process_running", return_value=True),
+            patch.object(cli, "vpn_task_exists", return_value=True),
             patch.object(cli, "probe_route", return_value=(True, "via eth1")),
             patch.object(cli, "tcp_reachable", return_value=True),
             redirect_stdout(output),
@@ -126,6 +133,7 @@ class VpnTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("VPN ready: yes", output.getvalue())
         self.assertIn("Windows SSL VPN client: running", output.getvalue())
+        self.assertIn("Pre-authorized VPN task: installed", output.getvalue())
 
     def test_windows_child_environment_excludes_secrets(self) -> None:
         environment = {
@@ -156,6 +164,7 @@ class VpnTests(unittest.TestCase):
             patch.object(cli, "is_wsl", return_value=True),
             patch.object(cli, "tcp_reachable", side_effect=[False, True]),
             patch.object(cli, "windows_vpn_process_running", return_value=False),
+            patch.object(cli, "vpn_task_exists", return_value=False),
             patch.object(cli, "launch_windows_vpn_client") as launch,
             patch.object(cli, "vpn_status", return_value=0),
         ):
@@ -163,6 +172,50 @@ class VpnTests(unittest.TestCase):
 
         self.assertEqual(status, 0)
         launch.assert_called_once()
+
+    def test_open_prefers_pre_authorized_task(self) -> None:
+        with (
+            patch.object(cli, "is_wsl", return_value=True),
+            patch.object(cli, "tcp_reachable", side_effect=[False, True]),
+            patch.object(cli, "windows_vpn_process_running", return_value=False),
+            patch.object(cli, "vpn_task_exists", return_value=True),
+            patch.object(cli, "run_vpn_task") as run_task,
+            patch.object(cli, "launch_windows_vpn_client") as direct_launch,
+            patch.object(cli, "vpn_status", return_value=0),
+        ):
+            status = cli.vpn_open(1, self.config())
+
+        self.assertEqual(status, 0)
+        run_task.assert_called_once_with()
+        direct_launch.assert_not_called()
+
+    def test_setup_registers_and_verifies_task(self) -> None:
+        config = self.config()
+        with (
+            patch.object(cli, "is_wsl", return_value=True),
+            patch.object(cli, "validate_vpn_client_for_task") as validate,
+            patch.object(cli, "run_elevated_powershell") as elevate,
+            patch.object(cli, "vpn_task_exists", return_value=True),
+        ):
+            status = cli.vpn_setup(config)
+
+        self.assertEqual(status, 0)
+        validate.assert_called_once_with(config.vpn_client)
+        setup_script = elevate.call_args.args[0]
+        self.assertIn("LogonType = 3", setup_script)
+        self.assertIn("RunLevel = 1", setup_script)
+        self.assertIn("AllowDemandStart", setup_script)
+
+    def test_remove_skips_elevation_when_task_is_absent(self) -> None:
+        with (
+            patch.object(cli, "is_wsl", return_value=True),
+            patch.object(cli, "vpn_task_exists", return_value=False),
+            patch.object(cli, "run_elevated_powershell") as elevate,
+        ):
+            status = cli.vpn_setup_remove()
+
+        self.assertEqual(status, 0)
+        elevate.assert_not_called()
 
     def test_open_requires_wsl(self) -> None:
         with patch.object(cli, "is_wsl", return_value=False):

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import errno
 import fcntl
 import os
@@ -31,6 +32,9 @@ DEFAULT_BASTION = "10.100.0.88"
 DEFAULT_SFTP_TARGET = "10.100.0.5"
 DEFAULT_OTP_ENTRY = "otp/aidd"
 DEFAULT_VPN_CLIENT = r"C:\Program Files (x86)\SafeConnect\SSLVPN Client\sslvpn-client.exe"
+VPN_TASK_FOLDER = r"\BJMU HPC"
+VPN_TASK_NAME = "SafeConnect"
+VPN_TASK_PATH = rf"{VPN_TASK_FOLDER}\{VPN_TASK_NAME}"
 VPN_PROCESS_NAME = "sslvpn-client"
 SENSITIVE_ENV_MARKERS = ("TOKEN", "PASSWORD", "PASSWD", "SECRET", "CREDENTIAL", "AUTH")
 AUTH_PROMPT = re.compile(
@@ -159,6 +163,16 @@ def powershell_executable() -> str:
     raise ConnectError("Windows PowerShell interop is unavailable; run this command from WSL")
 
 
+def schtasks_executable() -> str:
+    discovered = shutil.which("schtasks.exe")
+    if discovered:
+        return discovered
+    candidate = "/mnt/c/Windows/System32/schtasks.exe"
+    if os.path.isfile(candidate):
+        return candidate
+    raise ConnectError("Windows Task Scheduler interop is unavailable; run this command from WSL")
+
+
 def _secret_free_environment() -> dict[str, str]:
     child_env = os.environ.copy()
     for name in list(child_env):
@@ -168,6 +182,189 @@ def _secret_free_environment() -> dict[str, str]:
         ):
             child_env.pop(name, None)
     return child_env
+
+
+def _encoded_powershell(script: str) -> str:
+    return base64.b64encode(script.encode("utf-16le")).decode("ascii")
+
+
+def _powershell_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def validate_vpn_client_for_task(client_path: str) -> None:
+    client = _powershell_literal(client_path)
+    command = "$path = " + client + "\n" + r"""
+try { $item = Get-Item -LiteralPath $path -ErrorAction Stop } catch { exit 3 }
+if ($item.Name -ine 'sslvpn-client.exe') { exit 4 }
+$roots = @(
+    [Environment]::GetFolderPath('ProgramFiles'),
+    [Environment]::GetFolderPath('ProgramFilesX86')
+) | Where-Object { $_ }
+$fullPath = [IO.Path]::GetFullPath($item.FullName)
+$insideProgramFiles = $false
+foreach ($root in $roots) {
+    $fullRoot = [IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
+    if ($fullPath.StartsWith($fullRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        $insideProgramFiles = $true
+    }
+}
+if (-not $insideProgramFiles) { exit 4 }
+if ((Get-AuthenticodeSignature -FilePath $fullPath).Status -ne 'Valid') { exit 5 }
+exit 0
+"""
+    result = subprocess.run(
+        [powershell_executable(), "-NoProfile", "-NonInteractive", "-Command", command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=_secret_free_environment(),
+        timeout=20,
+        check=False,
+    )
+    if result.returncode == 3:
+        raise ConnectError(f"Windows VPN client was not found at {client_path}")
+    if result.returncode == 4:
+        raise ConnectError("vpn-setup accepts only sslvpn-client.exe installed under Windows Program Files")
+    if result.returncode == 5:
+        raise ConnectError("Windows reports that the VPN client signature is not valid")
+    if result.returncode != 0:
+        raise ConnectError("could not validate the Windows VPN client")
+
+
+def vpn_task_exists() -> bool:
+    result = subprocess.run(
+        [schtasks_executable(), "/Query", "/TN", VPN_TASK_PATH],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=_secret_free_environment(),
+        timeout=10,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def run_vpn_task() -> None:
+    result = subprocess.run(
+        [schtasks_executable(), "/Run", "/TN", VPN_TASK_PATH],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=_secret_free_environment(),
+        timeout=15,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ConnectError(f"Windows could not run the pre-authorized task {VPN_TASK_PATH}")
+
+
+def run_elevated_powershell(script: str) -> None:
+    encoded = _encoded_powershell(script)
+    command = (
+        "$arguments = @('-NoProfile', '-NonInteractive', '-EncodedCommand', "
+        + _powershell_literal(encoded)
+        + "); "
+        "$exe = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'; "
+        "try { "
+        "$process = Start-Process -FilePath $exe -Verb RunAs -ArgumentList $arguments "
+        "-Wait -PassThru -ErrorAction Stop; exit $process.ExitCode "
+        "} catch { exit 40 }"
+    )
+    try:
+        result = subprocess.run(
+            [powershell_executable(), "-NoProfile", "-NonInteractive", "-Command", command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=_secret_free_environment(),
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ConnectError("timed out while waiting for Windows elevation") from exc
+    if result.returncode == 40:
+        raise ConnectError("Windows elevation was cancelled or could not be started")
+    if result.returncode != 0:
+        raise ConnectError(f"the elevated Windows setup exited with status {result.returncode}")
+
+
+def vpn_setup_script(client_path: str) -> str:
+    client = _powershell_literal(client_path)
+    folder = _powershell_literal(VPN_TASK_FOLDER)
+    task_name = _powershell_literal(VPN_TASK_NAME)
+    return f"""
+$ErrorActionPreference = 'Stop'
+$client = {client}
+if (-not (Test-Path -LiteralPath $client)) {{ exit 3 }}
+$service = New-Object -ComObject 'Schedule.Service'
+$service.Connect()
+try {{
+    $taskFolder = $service.GetFolder({folder})
+}} catch {{
+    $taskFolder = $service.GetFolder('\\').CreateFolder('BJMU HPC', $null)
+}}
+$definition = $service.NewTask(0)
+$definition.RegistrationInfo.Description = 'Start the signed BJMU SafeConnect client on demand from WSL.'
+$definition.Principal.UserId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$definition.Principal.LogonType = 3
+$definition.Principal.RunLevel = 1
+$definition.Settings.Enabled = $true
+$definition.Settings.AllowDemandStart = $true
+$definition.Settings.DisallowStartIfOnBatteries = $false
+$definition.Settings.StopIfGoingOnBatteries = $false
+$definition.Settings.MultipleInstances = 2
+$definition.Settings.ExecutionTimeLimit = 'PT0S'
+$action = $definition.Actions.Create(0)
+$action.Path = $client
+$action.WorkingDirectory = Split-Path -Parent $client
+$null = $taskFolder.RegisterTaskDefinition(
+    {task_name}, $definition, 6, $definition.Principal.UserId, $null, 3, $null
+)
+exit 0
+"""
+
+
+def vpn_remove_script() -> str:
+    folder = _powershell_literal(VPN_TASK_FOLDER)
+    task_name = _powershell_literal(VPN_TASK_NAME)
+    return f"""
+$ErrorActionPreference = 'Stop'
+$service = New-Object -ComObject 'Schedule.Service'
+$service.Connect()
+$taskFolder = $service.GetFolder({folder})
+$taskFolder.DeleteTask({task_name}, 0)
+if ($taskFolder.GetTasks(0).Count -eq 0 -and $taskFolder.GetFolders(0).Count -eq 0) {{
+    $service.GetFolder('\\').DeleteFolder('BJMU HPC', 0)
+}}
+exit 0
+"""
+
+
+def vpn_setup(config: Config) -> int:
+    if not is_wsl():
+        raise ConnectError("vpn-setup is supported only from WSL with Windows interop enabled")
+    validate_vpn_client_for_task(config.vpn_client)
+    print(f"Windows will request one-time approval to register {VPN_TASK_PATH}.")
+    run_elevated_powershell(vpn_setup_script(config.vpn_client))
+    if not vpn_task_exists():
+        raise ConnectError("Windows did not register the pre-authorized VPN task")
+    print(f"Installed {VPN_TASK_PATH}; future vpn-open calls can start the fixed signed client without UAC.")
+    return 0
+
+
+def vpn_setup_remove() -> int:
+    if not is_wsl():
+        raise ConnectError("vpn-setup-remove is supported only from WSL with Windows interop enabled")
+    if not vpn_task_exists():
+        print(f"The task {VPN_TASK_PATH} is not installed.")
+        return 0
+    print(f"Windows will request approval to remove {VPN_TASK_PATH}.")
+    run_elevated_powershell(vpn_remove_script())
+    if vpn_task_exists():
+        raise ConnectError("Windows did not remove the pre-authorized VPN task")
+    print(f"Removed {VPN_TASK_PATH}.")
+    return 0
 
 
 def windows_vpn_process_running() -> bool:
@@ -217,17 +414,23 @@ def tcp_reachable(host: str, port: int = 22, timeout: float = 2.0) -> bool:
 def vpn_status(config: Config) -> int:
     wsl = is_wsl()
     process_label = "unavailable"
+    task_label = "unavailable"
     if wsl:
         try:
             process_label = "running" if windows_vpn_process_running() else "not running"
         except ConnectError as exc:
             process_label = f"unknown ({exc})"
+        try:
+            task_label = "installed" if vpn_task_exists() else "not installed"
+        except ConnectError as exc:
+            task_label = f"unknown ({exc})"
     route_ok, route_detail = probe_route(config.bastion)
     reachable = tcp_reachable(config.bastion)
     ready = wsl and reachable
 
     print(f"Environment: {'WSL' if wsl else 'unsupported (WSL required)'}")
     print(f"Windows SSL VPN client: {process_label}")
+    print(f"Pre-authorized VPN task: {task_label}")
     print(f"Route to {config.bastion}: {'present' if route_ok else 'absent'} ({route_detail})")
     print(f"Bastion {config.bastion}:22: {'reachable' if reachable else 'unreachable'}")
     print(f"VPN ready: {'yes' if ready else 'no'}")
@@ -235,24 +438,24 @@ def vpn_status(config: Config) -> int:
 
 
 def launch_windows_vpn_client(client_path: str) -> None:
-    child_env = _secret_free_environment()
-    child_env["BHC_VPN_CLIENT_PATH"] = client_path
     command = (
-        "$path = $env:BHC_VPN_CLIENT_PATH; "
+        "$path = " + _powershell_literal(client_path) + "; "
         "if (-not (Test-Path -LiteralPath $path)) { exit 3 }; "
-        "Start-Process -FilePath $path"
+        "try { Start-Process -FilePath $path -ErrorAction Stop; exit 0 } catch { exit 4 }"
     )
     result = subprocess.run(
         [powershell_executable(), "-NoProfile", "-NonInteractive", "-Command", command],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        env=child_env,
-        timeout=15,
+        env=_secret_free_environment(),
+        timeout=45,
         check=False,
     )
     if result.returncode == 3:
         raise ConnectError(f"Windows VPN client was not found at {client_path}")
+    if result.returncode == 4:
+        raise ConnectError("Windows elevation was cancelled or the SSL VPN client could not start")
     if result.returncode != 0:
         raise ConnectError("Windows could not start the SSL VPN client")
 
@@ -268,8 +471,12 @@ def vpn_open(wait_seconds: float, config: Config) -> int:
     if running:
         print("The Windows SSL VPN client is already running; complete login in its Windows window.")
     else:
-        launch_windows_vpn_client(config.vpn_client)
-        print("Started the Windows SSL VPN client; complete login in its Windows window.")
+        if vpn_task_exists():
+            run_vpn_task()
+            print("Started the Windows SSL VPN client through the pre-authorized task.")
+        else:
+            launch_windows_vpn_client(config.vpn_client)
+            print("Started the Windows SSL VPN client with direct Windows elevation.")
 
     if wait_seconds > 0:
         print(f"Waiting up to {wait_seconds:g} seconds for the BJMU bastion route...")
@@ -539,16 +746,22 @@ def parse_args() -> argparse.Namespace:
         metavar="SECONDS",
         help="wait for bastion reachability; defaults to BHC_VPN_WAIT_TIMEOUT or 60 (0 disables)",
     )
+    subparsers.add_parser("vpn-setup", help="register the fixed signed VPN client as an on-demand elevated task")
+    subparsers.add_parser("vpn-setup-remove", help="remove the pre-authorized VPN task")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
-        if args.mode in ("vpn-status", "vpn-open"):
+        if args.mode in ("vpn-status", "vpn-open", "vpn-setup", "vpn-setup-remove"):
             config = load_config(require_user=False)
             if args.mode == "vpn-status":
                 return vpn_status(config)
+            if args.mode == "vpn-setup":
+                return vpn_setup(config)
+            if args.mode == "vpn-setup-remove":
+                return vpn_setup_remove()
             wait_seconds = args.wait if args.wait is not None else config.vpn_wait_timeout
             if wait_seconds < 0:
                 raise ConnectError("--wait must be a non-negative number")
