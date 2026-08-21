@@ -13,7 +13,9 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import struct
+import subprocess
 import sys
 import termios
 import time
@@ -28,6 +30,9 @@ SAFE_NODE_PREFIX = re.compile(r"^[A-Za-z0-9_-]+$")
 DEFAULT_BASTION = "10.100.0.88"
 DEFAULT_SFTP_TARGET = "10.100.0.5"
 DEFAULT_OTP_ENTRY = "otp/aidd"
+DEFAULT_VPN_CLIENT = r"C:\Program Files (x86)\SafeConnect\SSLVPN Client\sslvpn-client.exe"
+VPN_PROCESS_NAME = "sslvpn-client"
+SENSITIVE_ENV_MARKERS = ("TOKEN", "PASSWORD", "PASSWD", "SECRET", "CREDENTIAL", "AUTH")
 AUTH_PROMPT = re.compile(
     r"(?:password|verification(?:\s+code)?|one[- ]time|otp|token|passcode|"
     r"dynamic\s+code|动态(?:口令|密钥|令牌)|验证码|二次验证)[^\r\n]{0,96}[:：]\s*$",
@@ -53,6 +58,8 @@ class Config:
     node_prefix: str
     default_node: int
     otp_timeout: float
+    vpn_client: str
+    vpn_wait_timeout: float
 
     @property
     def sftp_route(self) -> str:
@@ -70,18 +77,32 @@ def _positive_float(name: str, default: str) -> float:
     return value
 
 
-def load_config() -> Config:
+def _nonnegative_float(name: str, default: str) -> float:
+    raw = os.environ.get(name, default)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConnectError(f"{name} must be a non-negative number") from exc
+    if value < 0:
+        raise ConnectError(f"{name} must be a non-negative number")
+    return value
+
+
+def load_config(*, require_user: bool = True) -> Config:
     user = os.environ.get("BHC_USER", "").strip()
     bastion = os.environ.get("BHC_BASTION", DEFAULT_BASTION).strip()
     sftp_target = os.environ.get("BHC_SFTP_TARGET", DEFAULT_SFTP_TARGET).strip()
     otp_entry = os.environ.get("BHC_OTP_ENTRY", DEFAULT_OTP_ENTRY).strip()
     node_prefix = os.environ.get("BHC_NODE_PREFIX", "login").strip()
+    vpn_client = os.environ.get("BHC_VPN_CLIENT", DEFAULT_VPN_CLIENT).strip()
     try:
         default_node = int(os.environ.get("BHC_DEFAULT_NODE", "5"))
     except ValueError as exc:
         raise ConnectError("BHC_DEFAULT_NODE must be an integer from 1 to 7") from exc
 
-    if not user or not SAFE_USER.fullmatch(user):
+    if require_user and not user:
+        raise ConnectError("BHC_USER is required")
+    if user and not SAFE_USER.fullmatch(user):
         raise ConnectError("BHC_USER is required and may contain only letters, digits, '.', '_', or '-'")
     if not SAFE_HOST.fullmatch(bastion):
         raise ConnectError("BHC_BASTION contains unsupported characters")
@@ -93,6 +114,8 @@ def load_config() -> Config:
         raise ConnectError("BHC_NODE_PREFIX contains unsupported characters")
     if default_node not in range(1, 8):
         raise ConnectError("BHC_DEFAULT_NODE must be an integer from 1 to 7")
+    if not vpn_client:
+        raise ConnectError("BHC_VPN_CLIENT must not be empty")
 
     return Config(
         user=user,
@@ -102,6 +125,8 @@ def load_config() -> Config:
         node_prefix=node_prefix,
         default_node=default_node,
         otp_timeout=_positive_float("BHC_OTP_TIMEOUT", "20"),
+        vpn_client=vpn_client,
+        vpn_wait_timeout=_nonnegative_float("BHC_VPN_WAIT_TIMEOUT", "60"),
     )
 
 
@@ -112,6 +137,148 @@ def bootstrap_interactive_environment() -> None:
         return
     command = shlex.join([sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
     os.execvp("bash", ["bash", "-ic", f"export {marker}=1; exec {command}"])
+
+
+def is_wsl() -> bool:
+    if os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        with open("/proc/sys/kernel/osrelease", encoding="utf-8") as release_file:
+            return "microsoft" in release_file.read().lower()
+    except OSError:
+        return False
+
+
+def powershell_executable() -> str:
+    discovered = shutil.which("powershell.exe")
+    if discovered:
+        return discovered
+    candidate = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+    if os.path.isfile(candidate):
+        return candidate
+    raise ConnectError("Windows PowerShell interop is unavailable; run this command from WSL")
+
+
+def _secret_free_environment() -> dict[str, str]:
+    child_env = os.environ.copy()
+    for name in list(child_env):
+        upper_name = name.upper()
+        if name in ("DEFAULT_PWD", "BHC_GPG_PASSPHRASE", "SSHPASS") or any(
+            marker in upper_name for marker in SENSITIVE_ENV_MARKERS
+        ):
+            child_env.pop(name, None)
+    return child_env
+
+
+def windows_vpn_process_running() -> bool:
+    command = (
+        f"$p = Get-Process -Name '{VPN_PROCESS_NAME}' -ErrorAction SilentlyContinue; "
+        "if ($null -eq $p) { exit 1 } else { exit 0 }"
+    )
+    result = subprocess.run(
+        [powershell_executable(), "-NoProfile", "-NonInteractive", "-Command", command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=_secret_free_environment(),
+        timeout=10,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise ConnectError("could not query the Windows SSL VPN client process")
+    return result.returncode == 0
+
+
+def probe_route(host: str) -> tuple[bool, str]:
+    if shutil.which("ip") is None:
+        return False, "ip command unavailable"
+    result = subprocess.run(
+        ["ip", "route", "get", host],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False, "no route"
+    first_line = result.stdout.splitlines()[0] if result.stdout.splitlines() else "route resolved"
+    return True, " ".join(first_line.split())
+
+
+def tcp_reachable(host: str, port: int = 22, timeout: float = 2.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def vpn_status(config: Config) -> int:
+    wsl = is_wsl()
+    process_label = "unavailable"
+    if wsl:
+        try:
+            process_label = "running" if windows_vpn_process_running() else "not running"
+        except ConnectError as exc:
+            process_label = f"unknown ({exc})"
+    route_ok, route_detail = probe_route(config.bastion)
+    reachable = tcp_reachable(config.bastion)
+    ready = wsl and reachable
+
+    print(f"Environment: {'WSL' if wsl else 'unsupported (WSL required)'}")
+    print(f"Windows SSL VPN client: {process_label}")
+    print(f"Route to {config.bastion}: {'present' if route_ok else 'absent'} ({route_detail})")
+    print(f"Bastion {config.bastion}:22: {'reachable' if reachable else 'unreachable'}")
+    print(f"VPN ready: {'yes' if ready else 'no'}")
+    return 0 if ready else 1
+
+
+def launch_windows_vpn_client(client_path: str) -> None:
+    child_env = _secret_free_environment()
+    child_env["BHC_VPN_CLIENT_PATH"] = client_path
+    command = (
+        "$path = $env:BHC_VPN_CLIENT_PATH; "
+        "if (-not (Test-Path -LiteralPath $path)) { exit 3 }; "
+        "Start-Process -FilePath $path"
+    )
+    result = subprocess.run(
+        [powershell_executable(), "-NoProfile", "-NonInteractive", "-Command", command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=child_env,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode == 3:
+        raise ConnectError(f"Windows VPN client was not found at {client_path}")
+    if result.returncode != 0:
+        raise ConnectError("Windows could not start the SSL VPN client")
+
+
+def vpn_open(wait_seconds: float, config: Config) -> int:
+    if not is_wsl():
+        raise ConnectError("vpn-open is supported only from WSL with Windows interop enabled")
+    if tcp_reachable(config.bastion):
+        print("The BJMU VPN route is already ready; no client was started.")
+        return vpn_status(config)
+
+    running = windows_vpn_process_running()
+    if running:
+        print("The Windows SSL VPN client is already running; complete login in its Windows window.")
+    else:
+        launch_windows_vpn_client(config.vpn_client)
+        print("Started the Windows SSL VPN client; complete login in its Windows window.")
+
+    if wait_seconds > 0:
+        print(f"Waiting up to {wait_seconds:g} seconds for the BJMU bastion route...")
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            if tcp_reachable(config.bastion):
+                return vpn_status(config)
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    return vpn_status(config)
 
 
 def read_otp(timeout: float, otp_entry: str) -> str:
@@ -336,7 +503,7 @@ def check(otp_timeout: float, include_otp: bool, config: Config) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Open BJMU HPC SSH/SFTP sessions with in-memory OTP injection.",
+        description="Open BJMU HPC sessions and manage the supported Windows VPN client from WSL.",
     )
     parser.add_argument(
         "--otp-timeout",
@@ -361,12 +528,32 @@ def parse_args() -> argparse.Namespace:
 
     check_parser = subparsers.add_parser("check", help="validate local prerequisites")
     check_parser.add_argument("--with-otp", action="store_true", help="also validate OTP retrieval")
+
+    subparsers.add_parser("vpn-status", help="diagnose the Windows VPN client, route, and bastion port")
+
+    vpn_open_parser = subparsers.add_parser("vpn-open", help="start the supported Windows VPN client from WSL")
+    vpn_open_parser.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="wait for bastion reachability; defaults to BHC_VPN_WAIT_TIMEOUT or 60 (0 disables)",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
+        if args.mode in ("vpn-status", "vpn-open"):
+            config = load_config(require_user=False)
+            if args.mode == "vpn-status":
+                return vpn_status(config)
+            wait_seconds = args.wait if args.wait is not None else config.vpn_wait_timeout
+            if wait_seconds < 0:
+                raise ConnectError("--wait must be a non-negative number")
+            return vpn_open(wait_seconds, config)
+
         bootstrap_interactive_environment()
         config = load_config()
         otp_timeout = args.otp_timeout if args.otp_timeout is not None else config.otp_timeout

@@ -7,6 +7,7 @@
 - Linux and Python 3.10+
 - BJMU VPN access
 - OpenSSH client, `sshpass`, GnuPG 2.x, `gopass`, and `pipx`
+- For `vpn-open`: WSL 2 with Windows interop and the BJMU-provided SafeConnect/DPtech SSL VPN client 10.1.14.0 installed on Windows
 
 On Ubuntu or Debian:
 
@@ -68,6 +69,8 @@ See the [gopass OTP documentation](https://github.com/gopasspw/gopass/blob/maste
 | `BHC_DEFAULT_NODE` | No | `5` | Default node suffix (`1`–`7`) |
 | `BHC_NODE_PREFIX` | No | `login` | Login asset prefix |
 | `BHC_OTP_TIMEOUT` | No | `20` | gopass timeout in seconds |
+| `BHC_VPN_CLIENT` | No | SafeConnect 10.1.14.0 default path | Windows VPN client executable |
+| `BHC_VPN_WAIT_TIMEOUT` | No | `60` | Seconds `vpn-open` waits for the bastion route; `0` disables waiting |
 
 Set non-secret values in your shell configuration:
 
@@ -99,6 +102,8 @@ bhc check --with-otp
 ## Usage
 
 ```bash
+bhc vpn-status    # inspect the Windows client, WSL route, and bastion port
+bhc vpn-open      # start the Windows client and wait for the route
 bhc ssh          # default: login05
 bhc ssh -N 1     # login01
 bhc ssh -N 5     # login05
@@ -107,10 +112,13 @@ bhc check
 bhc check --with-otp
 ```
 
+`vpn-open` launches the installed Windows client from WSL; it does not enter, store, or bypass VPN credentials. Complete authentication in the Windows client window, then use `bhc vpn-status` to verify that `10.100.0.88:22` is reachable. These commands require Windows interop and are not a replacement Linux VPN implementation.
+
 `-N` specifies the numeric suffix of the asset name, not the gateway menu position. Run long workloads through Slurm rather than directly on a login node.
 
 ## Troubleshooting
 
+- If `VPN ready: no`, complete authentication in the Windows client and check that WSL mirrored networking is enabled.
 - A timeout or unreachable gateway usually indicates a disconnected BJMU VPN.
 - `gopass could not read ...` indicates a missing OTP entry, GPG unlock failure, or invalid OTP data.
 - `DEFAULT_PWD is unset` means the current shell has not exported the gateway password.
