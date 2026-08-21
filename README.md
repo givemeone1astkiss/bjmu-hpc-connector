@@ -99,6 +99,43 @@ pipx install .
 bhc check --with-otp
 ```
 
+A sanitized Codex Skill is provided at [`skills/bjmu-hpc/SKILL.md`](skills/bjmu-hpc/SKILL.md). It contains no account name, password, OTP value, or workstation identifier and relies on the environment variables above.
+
+## Configure Windows VPN access from WSL
+
+Install the BJMU-provided SafeConnect/DPtech SSL VPN client on Windows first. Do not install an unofficial Linux replacement or copy VPN credentials into WSL.
+
+On Windows 11 22H2 or later, WSL 2 mirrored networking provides better VPN compatibility. Add the following to `%UserProfile%\.wslconfig` on Windows, preserving unrelated existing settings:
+
+```ini
+[wsl2]
+networkingMode=mirrored
+dnsTunneling=true
+firewall=true
+autoProxy=true
+```
+
+Apply a changed `.wslconfig` from Windows PowerShell with `wsl --shutdown`, noting that this stops every running WSL distribution. Reopen WSL and verify the client, route, and bastion port:
+
+```bash
+bhc vpn-status
+```
+
+The Windows client requires administrator elevation. Register its fixed signed executable as an on-demand task once:
+
+```bash
+bhc vpn-setup
+```
+
+Windows displays one UAC prompt during setup. The task uses the current interactive Windows user, stores no password, has no automatic trigger or caller-controlled arguments, and accepts only a validly signed `sslvpn-client.exe` under Windows Program Files. Normal use is then:
+
+```bash
+bhc vpn-open
+bhc vpn-status
+```
+
+`vpn-open` starts the task without another UAC prompt and waits for bastion reachability. If the task is not installed, it falls back to direct Windows elevation. Remove the task with `bhc vpn-setup-remove` when it is no longer wanted. Set `BHC_VPN_CLIENT` only for another protected Windows installation path, and use `BHC_VPN_WAIT_TIMEOUT=0` or `bhc vpn-open --wait 0` to disable waiting.
+
 ## Usage
 
 ```bash
