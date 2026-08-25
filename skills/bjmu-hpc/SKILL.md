@@ -20,6 +20,15 @@ Do not depend on the legacy `sshpc` or `sftpc` aliases. The connector invokes `s
 
 ## Establish and diagnose the VPN
 
+### Network execution boundary
+
+Do not run cluster connectivity commands in a restricted filesystem/network sandbox. A sandbox can hide the Windows VPN process and its injected WSL route, causing a false disconnected result even when the normal WSL session can reach the cluster.
+
+- Run `bhc vpn-status`, `bhc vpn-open`, `bhc check`, `bhc ssh`, `bhc sftp`, and direct bastion reachability checks with network access outside the restricted sandbox.
+- Filesystem-only inspection of the skill or project files may remain sandboxed.
+- Never report the VPN as down from a sandboxed negative result. Repeat the check with real network access before asking the user to reconnect.
+- An already-open SSH PTY may survive while a new sandboxed connection appears to fail; this does not prove that SFTP or fresh authentication is unavailable.
+
 Run the read-only diagnostic before retrying credentials when the bastion is unavailable:
 
 ```bash
@@ -159,6 +168,62 @@ The platform documentation contains example Slurm accounts and QoS values that a
 
 ## Submit reproducible jobs
 
+### Resolve account and QoS from live associations
+
+Slurm accounts and QoS values are user- and partition-specific. Determine the active mapping from live `sacctmgr` associations, administrator guidance, or a recently completed user-owned job. Do not substitute a Unix group for `--account`, guess a QoS from a partition name, or publish account-specific mappings in a reusable Skill.
+
+After an invalid-account or invalid-QoS error, re-check the account/partition/QoS tuple before retrying. Treat every GPU partition as an available platform choice rather than a default or ranking; select it from model memory, precision, throughput, queue state, and experiment urgency.
+
+### GPU job-file parameter semantics and placeholder form
+
+Resolve every resource directive from the workload and current cluster state:
+
+| Directive | Meaning | Selection rule |
+|---|---|---|
+| `--job-name` | Short queue/log identifier | Use a concise experiment-specific name. |
+| `--partition` | Hardware/queue platform | Choose from live GPU partitions after checking `sinfo`; it is not a generic GPU flag. |
+| `--account` | Slurm allocation charged by the job | Use the live verified project account. |
+| `--qos` | Limits and priority policy | Must match the chosen account and partition according to live associations. |
+| `--nodes` | Number of compute nodes | Use one unless the workload intentionally implements multi-node distributed execution. |
+| `--ntasks` | Number of Slurm-launched processes | Distinguish a single `torchrun` launcher from one task per rank; match the actual launch command. |
+| `--cpus-per-task` | CPU threads allocated to each task | Size from DataLoader workers, preprocessing, and chemistry work; do not copy a fixed value. |
+| `--gres=gpu:<N>` | GPUs allocated per node | Request only the GPUs actually consumed by the program and distributed strategy. |
+| `--time` | Hard wall-time limit | Estimate from smoke-test throughput plus validation/checkpoint margin; it is not expected runtime. |
+| `--no-requeue` | Disable automatic restart | Keep unless requeue/resume semantics were deliberately implemented and tested. |
+| `--output` / `--error` | Slurm stdout/stderr destinations | Use separate absolute Lustre paths; `%j` is job ID and `%A_%a` is array job/task. |
+| `--array` | Optional indexed task set | Use only for independent configurations with an explicit index-to-config mapping. |
+
+Use a project-owned `.sbatch` file with placeholders. This template is intentionally not directly submittable: replace every angle-bracketed value from experiment requirements and live cluster state.
+
+```bash
+#!/usr/bin/env bash
+#SBATCH --job-name=<experiment_name>
+#SBATCH --partition=<gpu_platform_partition>
+#SBATCH --account=<verified_slurm_account>
+#SBATCH --qos=<qos_matching_account_and_partition>
+#SBATCH --nodes=<compute_node_count>
+#SBATCH --ntasks=<slurm_task_count>
+#SBATCH --cpus-per-task=<cpu_threads_per_task>
+#SBATCH --gres=gpu:<gpu_count_per_node>
+#SBATCH --time=<wall_time_limit_HH:MM:SS>
+#SBATCH --no-requeue
+#SBATCH --output=<absolute_lustre_log_dir>/<experiment_name>-%j.out
+#SBATCH --error=<absolute_lustre_log_dir>/<experiment_name>-%j.err
+
+project_root=<absolute_lustre_project_root>
+source /appsnew/source/Anaconda3-2025.06-1.sh
+conda activate <verified_conda_environment>
+set -euo pipefail
+
+cd "$project_root"
+export PYTHONPATH="$project_root:${PYTHONPATH:-}"
+echo "host=$(hostname) date=$(date --iso-8601=seconds)"
+python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))'
+<exact_program_command_with_explicit_config_seed_and_resume_policy>
+```
+
+Create the absolute log directory before submission. Keep `source` and `conda activate` before `set -u`: activation scripts may read unset variables, and enabling nounset first can terminate the job before the application starts. For arrays use `%A_%a` in log names and preserve the exact task-to-configuration mapping. If an array task exits immediately with empty logs and no `GRES_IDX`, retry a single non-array job from a known-good template before diagnosing the model or Python code.
+
 Prefer a project-owned script such as `scripts/slurm/<experiment>.sbatch` over an ad hoc login-node command. Include:
 
 - explicit job name, partition, node/GPU/CPU/memory/time requests;
@@ -182,11 +247,20 @@ sacct -j <job-id> --format=JobID,JobName,Partition,State,Elapsed,ExitCode
 tail -n 100 <stdout-or-stderr-log>
 ```
 
-Correlate Slurm state with log timestamps, checkpoint timestamps, TensorBoard event files, GPU utilization, and metric progression. Treat a missing queue entry as ambiguous until `sacct` and logs show whether it completed or failed.
+After every GPU submission, once `squeue` reports `R` and the application has had enough time to initialize, verify the assigned compute node with:
+
+```bash
+gpuinfo <compute-hostname>
+```
+
+`gpuinfo` requires a compute hostname; it does not have a conventional `--help` mode. Map the job to the node and its allocated device indices with `squeue` and `scontrol show job -dd <job-id>` (`GRES_IDX=gpu(IDX:...)`) before interpreting node-wide output. Confirm that the expected number of CUDA processes appears on those indices, memory allocation is nonzero, and utilization is plausible for the current phase. Repeat after a short interval when one sample could coincide with initialization, validation, checkpointing, or CPU preprocessing.
+
+Correlate Slurm state with `gpuinfo`, log timestamps, checkpoint timestamps, TensorBoard event files, and metric progression. Slurm allocation and physical use are distinct: a GPU can be allocated while `gpuinfo` shows zero memory and no process. Repeated zero-memory samples on allocated indices indicate that the job is not currently using CUDA; inspect its job steps and logs for a stalled wrapper, CPU-only phase, failed launch, or wait condition. Conversely, low memory use is not itself a fault when compute utilization and throughput are high. Treat a missing queue entry as ambiguous until `sacct` and logs show whether it completed or failed.
 
 - `PD`: inspect pending reason, partition, requested resources, account, and QoS.
 - `OUT_OF_MEMORY`: inspect CPU versus GPU OOM and adjust the corresponding memory or batch configuration.
 - `No space left on device`: inspect `TMPDIR` and storage quota; move temporary work to the job-specific Lustre directory.
+- `R` but no CUDA process on allocated GPUs: check `GRES_IDX`, sample `gpuinfo` again, then inspect job steps and logs before deciding whether the job is stalled.
 - Network loss does not imply the batch job stopped. Reconnect after VPN recovery and query Slurm before taking action.
 - Cancel a job only when the user requests it or when cancellation is an explicit part of an authorized experimental decision rule.
 
