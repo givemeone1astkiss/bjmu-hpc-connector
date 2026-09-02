@@ -1,6 +1,6 @@
 ---
 name: bjmu-hpc
-description: Connect to and operate the Peking University AI4DD BJMUHPC cluster through its VPN and bastion host. Use for automated bhc SSH or SFTP access, project upload, Conda setup, Lustre storage selection, Slurm GPU/CPU submission, job monitoring, log retrieval, and diagnosing VPN, queue, environment, or storage failures.
+description: Connect to and operate the Peking University AI4DD BJMUHPC cluster through its VPN and bastion host. Use for automated bhc SSH or SFTP access, project upload, Conda setup, Lustre storage selection, metered Slurm GPU/CPU submission, job monitoring, log retrieval, and diagnosing VPN, queue, environment, storage, or billing-record failures.
 ---
 
 # BJMU HPC
@@ -193,34 +193,12 @@ Resolve every resource directive from the workload and current cluster state:
 | `--output` / `--error` | Slurm stdout/stderr destinations | Use separate absolute Lustre paths; `%j` is job ID and `%A_%a` is array job/task. |
 | `--array` | Optional indexed task set | Use only for independent configurations with an explicit index-to-config mapping. |
 
-Use a project-owned `.sbatch` file with placeholders. This template is intentionally not directly submittable: replace every angle-bracketed value from experiment requirements and live cluster state.
-
-```bash
-#!/usr/bin/env bash
-#SBATCH --job-name=<experiment_name>
-#SBATCH --partition=<gpu_platform_partition>
-#SBATCH --account=<verified_slurm_account>
-#SBATCH --qos=<qos_matching_account_and_partition>
-#SBATCH --nodes=<compute_node_count>
-#SBATCH --ntasks=<slurm_task_count>
-#SBATCH --cpus-per-task=<cpu_threads_per_task>
-#SBATCH --gres=gpu:<gpu_count_per_node>
-#SBATCH --time=<wall_time_limit_HH:MM:SS>
-#SBATCH --no-requeue
-#SBATCH --output=<absolute_lustre_log_dir>/<experiment_name>-%j.out
-#SBATCH --error=<absolute_lustre_log_dir>/<experiment_name>-%j.err
-
-project_root=<absolute_lustre_project_root>
-source /appsnew/source/Anaconda3-2025.06-1.sh
-conda activate <verified_conda_environment>
-set -euo pipefail
-
-cd "$project_root"
-export PYTHONPATH="$project_root:${PYTHONPATH:-}"
-echo "host=$(hostname) date=$(date --iso-8601=seconds)"
-python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))'
-<exact_program_command_with_explicit_config_seed_and_resume_policy>
-```
+Use a project-owned `.sbatch` file based on
+[`assets/slurm_job_template.sbatch`](assets/slurm_job_template.sbatch). The
+template is intentionally not directly submittable: replace every
+angle-bracketed value from experiment requirements and live cluster state. It
+contains mandatory default accounting prefix/suffix logic; preserve that logic
+when generating project-specific job files.
 
 Create the absolute log directory before submission. Keep `source` and `conda activate` before `set -u`: activation scripts may read unset variables, and enabling nounset first can terminate the job before the application starts. For arrays use `%A_%a` in log names and preserve the exact task-to-configuration mapping. If an array task exits immediately with empty logs and no `GRES_IDX`, retry a single non-array job from a known-good template before diagnosing the model or Python code.
 
@@ -234,6 +212,37 @@ Prefer a project-owned script such as `scripts/slurm/<experiment>.sbatch` over a
 - `TMPDIR` setup when the workload writes large temporary files;
 - the exact Hydra configuration/overrides, random seed, and resume checkpoint;
 - startup diagnostics such as hostname, date, Python/PyTorch/CUDA versions, and visible GPUs.
+
+### Mandatory job timer and monthly cost ledger
+
+Every newly generated Slurm script must retain the accounting prefix and EXIT /
+signal traps from the bundled template. They start timing when the batch script
+begins and record one tab-separated job row at termination in:
+
+```text
+$HOME/bjmu_hpc_billing/YYYY-MM.tsv
+```
+
+The completion month selects the file. The final row is always `Sum`, with the
+sum of all numeric estimates in the `estimated_cost_cny` column. At every job
+completion, the template removes the previous summary, appends the completed job,
+recalculates the total, and writes a new summary. `NA` costs remain visible but
+are excluded from the total.
+
+The complete read-modify-write transaction uses a separate stable
+`YYYY-MM.tsv.lock` file and atomic replacement. Keep the ledger under `/home`,
+which supports `flock`, rather than `/lustre1`.
+
+GPU estimates use allocated cards × elapsed hours × card-hour rate. CPU estimates
+use allocated cores × elapsed hours × core-hour rate. Prefer Slurm allocation
+data and use environment variables only as a fallback; write `NA` for unknown
+partitions or unparsable allocations instead of guessing. Preserve the original
+application exit code even if ledger creation fails.
+
+Keep `#SBATCH --signal=B:TERM@60` for a best-effort record near a time limit.
+Uncatchable termination, node failure, or a filesystem outage may still require
+later reconciliation from `sacct`. Read [the billing reference](references/billing.md)
+before changing rates, formulas, schema, or charging class.
 
 Use `sbatch` only after validating paths and configuration. A short `bjmurun-*` smoke test is acceptable for resource verification, but preserve a reviewed Slurm script for real experiments.
 
@@ -266,7 +275,10 @@ Correlate Slurm state with `gpuinfo`, log timestamps, checkpoint timestamps, Ten
 
 ## Handoff record
 
-After any submission, report the remote project directory, environment, job ID, partition/GPU count, log paths, configuration, checkpoint/resume policy, and next check criterion. Never report passwords or OTP values.
+After any submission, report the remote project directory, environment, job ID,
+partition/GPU or CPU allocation, log paths, configuration, checkpoint/resume
+policy, monthly ledger path, applicable unit rate, and next check criterion. Never
+report passwords or OTP values.
 
 ## Authoritative guide
 

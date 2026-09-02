@@ -99,7 +99,10 @@ pipx install .
 bhc check --with-otp
 ```
 
-A sanitized Codex Skill is provided at [`skills/bjmu-hpc/SKILL.md`](skills/bjmu-hpc/SKILL.md). It contains no account name, password, OTP value, or workstation identifier and relies on the environment variables above.
+A sanitized Codex Skill is provided under [`skills/bjmu-hpc`](skills/bjmu-hpc).
+It contains no account name, password, OTP value, or workstation identifier and
+relies on the environment variables above. Copy the complete directory so its
+Slurm template and billing reference remain available to the Skill.
 
 ## Configure Windows VPN access from WSL
 
@@ -155,6 +158,26 @@ Run `vpn-setup` once to register `\BJMU HPC\SafeConnect` as an on-demand Windows
 `vpn-open` does not enter, store, or bypass VPN credentials. Complete VPN authentication in the Windows client when necessary, then use `bhc vpn-status` to verify that `10.100.0.88:22` is reachable. Without the task, `vpn-open` falls back to direct Windows elevation. These commands require Windows interop and are not a replacement Linux VPN implementation.
 
 `-N` specifies the numeric suffix of the asset name, not the gateway menu position. Run long workloads through Slurm rather than directly on a login node.
+
+## Slurm template and monthly cost estimates
+
+The Skill includes a reusable, deliberately non-submittable job template at
+[`skills/bjmu-hpc/assets/slurm_job_template.sbatch`](skills/bjmu-hpc/assets/slurm_job_template.sbatch).
+Resolve every angle-bracketed resource, path, environment, and command placeholder
+before calling `sbatch`; account and QoS values must come from the user's live
+cluster associations.
+
+The template times each job and records a monthly estimate in
+`$HOME/bjmu_hpc_billing/YYYY-MM.tsv`. Each normal job row includes allocation,
+rate, elapsed time, estimated cost, exit code, and signal. The last row is always
+`Sum`, recalculated after every completion. Concurrent finishes are serialized
+with a separate lock file and an atomic TSV replacement. Unknown allocations or
+partitions are recorded as `NA` and are not guessed or added to the total.
+
+The rates and formula are documented in
+[`skills/bjmu-hpc/references/billing.md`](skills/bjmu-hpc/references/billing.md).
+These values are estimates; the cluster's accounting system and invoice remain
+authoritative.
 
 ## Troubleshooting
 
