@@ -47,7 +47,7 @@ bjmu_record_bill() {
   case "$partition" in
     gpu_l40|gpu_l48|gpu_a800|gpu_h100)
       unit_kind=gpu
-      allocated_units=$(printf '%s\n' "$job_line" | sed -nE 's/.*AllocTRES=[^ ]*gres\/gpu=([0-9]+).*/\1/p')
+      allocated_units=$(printf '%s\n' "$job_line" | sed -nE 's/.*[[:space:]](AllocTRES|TRES)=[^ ]*gres\/gpu=([0-9]+).*/\2/p')
       if [[ ! "$allocated_units" =~ ^[0-9]+$ ]]; then
         if [[ "${SLURM_GPUS_ON_NODE:-}" =~ ^[0-9]+$ && "${SLURM_JOB_NUM_NODES:-}" =~ ^[0-9]+$ ]]; then
           allocated_units=$((SLURM_GPUS_ON_NODE * SLURM_JOB_NUM_NODES))
@@ -93,6 +93,8 @@ bjmu_record_bill() {
   billing_dir="$HOME/bjmu_hpc_billing"
   billing_file="$billing_dir/$billing_month.tsv"
   billing_lock="$billing_file.lock"
+  (
+  set -e
   mkdir -p "$billing_dir"
 
   # Lock a separate, stable inode so the ledger can be atomically replaced.
@@ -117,6 +119,7 @@ bjmu_record_bill() {
   mv -f "$billing_tmp" "$billing_file"
   flock -u 9
   exec 9>&-
+  ) || echo "WARNING: billing update failed for job $job_id; reconcile with sacct" >&2
 
   exit "$application_exit_code"
 }

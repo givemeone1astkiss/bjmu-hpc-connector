@@ -35,6 +35,20 @@ administration rather than guessing from institution text.
 
 ## Ledger schema
 
+Allocation parsing must support both `TRES=` (the current cluster's `scontrol`
+output) and `AllocTRES=`. `sacct` exposes `AllocTRES` as a separate export column.
+Do not assume `SLURM_GPUS_ON_NODE` is populated for every `--gres` job. Test with
+real Slurm output before relying on an environment-only simulation. Preserve
+all partition alternatives in the accounting code when changing job directives;
+never globally replace partition names throughout a job script.
+
+For historical `NA` rows, export `JobIDRaw,Partition,ElapsedRaw,AllocCPUS,AllocTRES,State`
+using `sacct -X -n -P` with explicit dates. Match allocation rows by job ID (exclude
+`.batch` and other steps), preserve recorded timer durations and multipliers,
+back up the TSV, then reconcile it under the existing lock and regenerate `Sum`.
+Submitted jobs retain their original script copies; reconcile those after they
+finish even if their source scripts have already been fixed.
+
 `$HOME/bjmu_hpc_billing/YYYY-MM.tsv` uses these columns:
 
 ```text

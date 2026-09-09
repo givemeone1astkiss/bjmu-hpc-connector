@@ -179,6 +179,11 @@ The rates and formula are documented in
 These values are estimates; the cluster's accounting system and invoice remain
 authoritative.
 
+The allocation parser accepts both `TRES=` and `AllocTRES=` from Slurm. When
+upgrading an older template, historical `NA` records require reconciliation from
+`sacct`; updating a script does not update copies already submitted to Slurm.
+See the billing reference for the reconciliation fields and backup procedure.
+
 ## Troubleshooting
 
 - If `VPN ready: no`, complete authentication in the Windows client and check that WSL mirrored networking is enabled.
