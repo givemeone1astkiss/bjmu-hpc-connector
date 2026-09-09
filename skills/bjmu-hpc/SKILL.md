@@ -172,7 +172,20 @@ The platform documentation contains example Slurm accounts and QoS values that a
 
 Slurm accounts and QoS values are user- and partition-specific. Determine the active mapping from live `sacctmgr` associations, administrator guidance, or a recently completed user-owned job. Do not substitute a Unix group for `--account`, guess a QoS from a partition name, or publish account-specific mappings in a reusable Skill.
 
-After an invalid-account or invalid-QoS error, re-check the account/partition/QoS tuple before retrying. Treat every GPU partition as an available platform choice rather than a default or ranking; select it from model memory, precision, throughput, queue state, and experiment urgency.
+After an invalid-account or invalid-QoS error, re-check the account/partition/QoS
+tuple before retrying.
+
+### Platform selection priority
+
+Use the platform preference **L40 > H100 > A800** for new jobs and rescheduling.
+First consider the L40 family (`gpu_l40` for L40 and `gpu_l48` for L40S), then
+`gpu_h100`, and finally `gpu_a800`. Within the L40 family, choose from actual
+availability and workload requirements. Move to a lower-priority platform when
+the preferred platform cannot meet memory, hardware, or scheduling requirements;
+briefly record the reason in the job handoff. This is a resource-selection
+preference, not a claim about hardware speed. Check live availability and select
+the matching account/QoS; keep resource fields workload-specific placeholders
+until resolved for submission.
 
 ### GPU job-file parameter semantics and placeholder form
 
