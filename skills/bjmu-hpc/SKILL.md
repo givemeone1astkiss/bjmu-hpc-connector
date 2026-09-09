@@ -239,6 +239,14 @@ data and use environment variables only as a fallback; write `NA` for unknown
 partitions or unparsable allocations instead of guessing. Preserve the original
 application exit code even if ledger creation fails.
 
+When generating scripts, support both `TRES=` and `AllocTRES=` from `scontrol`;
+`SLURM_GPUS_ON_NODE` may be unset for `--gres` jobs. Change partition directives
+without globally replacing names in the accounting code, preserving GPU and CPU
+rate mappings. After the first job finishes with a new template, compare its
+recorded resource count and cost with Slurm allocations and check that the single
+final `Sum` equals all numeric job costs. Treat unexpected `NA` as an accounting
+failure requiring investigation before reusing the template.
+
 Keep `#SBATCH --signal=B:TERM@60` for a best-effort record near a time limit.
 Uncatchable termination, node failure, or a filesystem outage may still require
 later reconciliation from `sacct`. Read [the billing reference](references/billing.md)

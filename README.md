@@ -180,9 +180,9 @@ These values are estimates; the cluster's accounting system and invoice remain
 authoritative.
 
 The allocation parser accepts both `TRES=` and `AllocTRES=` from Slurm. When
-upgrading an older template, historical `NA` records require reconciliation from
-`sacct`; updating a script does not update copies already submitted to Slurm.
-See the billing reference for the reconciliation fields and backup procedure.
+selecting a job partition, edit its directives without globally replacing
+partition names in the accounting code. Verify the first completed job's
+allocation, cost, and monthly `Sum` against Slurm records.
 
 ## Troubleshooting
 
